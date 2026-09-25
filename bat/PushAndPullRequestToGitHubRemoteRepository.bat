@@ -2,8 +2,10 @@
 setlocal
 
 REM ==============================================================================
-REM Description: Commits local changes onto a temporary branch, pushes it with
-REM   a temporary branch, pushes it with a plain push (force-push forbidden),
+REM Description: Commits local changes onto a temporary branch with a
+REM   deterministic sync(codecommit) subject/body (locale-independent),
+REM   pushes it with a plain push (force-push forbidden), tags the sync commit
+REM   as sync-vYYYY.MM.DD-N, prepends a CHANGELOG.md entry, and opens a PR to
 REM   target branch. The API call is idempotent: an already-open PR between the
 REM   same branches is reused instead of duplicated. The API token is NEVER a
 REM   CLI argument; it is read from the GH_TOKEN environment variable, which
@@ -12,12 +14,15 @@ REM Author: pipeline-security implementer
 REM Usage: PushAndPullRequestToGitHubRemoteRepository.bat <LocalPath> <owner/repo> <UserName> <Email> <TempBranch> <BaseBranch>
 REM   Help: PushAndPullRequestToGitHubRemoteRepository.bat /?
 REM Env Vars: GH_TOKEN (required, API token), WORKSPACE (optional, response file target)
-REM   SYNC_SHA, SYNC_TIMESTAMP (traceability, set by Jenkins 'Generate sync metadata'
-REM   stage), BUILD_TAG, BUILD_URL (Jenkins built-ins reused for the PR body).
-REM   When SYNC_*/BUILD_* are unset (local runs) they default to "unknown".
+REM   SYNC_SHA (required, 40-hex CodeCommit HEAD set by Jenkins 'Generate sync
+REM   metadata' stage), SYNC_TIMESTAMP, BUILD_TAG, BUILD_URL (traceability;
+REM   unset values default to "unknown", and an unknown timestamp is replaced
+REM   with the current UTC time in strict Zulu form).
 REM Dependencies: git, curl (7.76+ for --fail-with-body), python3 (JSON checks)
+REM   plus py\format_sync_message.py and py\next_sync_tag.py (repo's py dir).
 REM Output: pullrequest_response.json in %WORKSPACE% (or cwd when WORKSPACE is
-REM   unset); informational messages on stdout, errors on stderr.
+REM   unset); sync-v tag pushed to origin; CHANGELOG.md seeded/prepended at the
+REM   repo root; informational messages on stdout, errors on stderr.
 REM   Exit codes: 0 success (or nothing to commit), 1 any failure.
 REM ==============================================================================
 
@@ -70,6 +75,14 @@ IF NOT DEFINED SYNC_SHA SET "SYNC_SHA=unknown"
 IF NOT DEFINED BUILD_TAG SET "BUILD_TAG=unknown"
 IF NOT DEFINED BUILD_URL SET "BUILD_URL=unknown"
 IF NOT DEFINED SYNC_TIMESTAMP SET "SYNC_TIMESTAMP=unknown"
+REM Versioning helpers live in the repo's py dir (parent of this bat dir).
+SET "PyDir=%~dp0..\py"
+SET "ChangelogFile=%~dp0..\CHANGELOG.md"
+REM A missing/placeholder timestamp becomes current UTC in strict Zulu form,
+REM so the sync(codecommit) subject is always locale-independent.
+IF "%SYNC_TIMESTAMP%"=="unknown" (
+    FOR /F "delims=" %%T IN ('powershell -NoProfile -Command "(Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')"') DO SET "SYNC_TIMESTAMP=%%T"
+)
 SET "PullRequestTitle=Update from CodeCommit repository (%SYNC_SHA:~0,7%)"
 SET "PullRequestBody=Update from CodeCommit repository on branch %TemporaryBranch% of repository %GitHubRepositoryName%.\n\nCodeCommit SHA: %SYNC_SHA%\nJenkins Build: %BUILD_TAG% %BUILD_URL%\nTimestamp UTC: %SYNC_TIMESTAMP%"
 IF DEFINED WORKSPACE (
@@ -127,15 +140,55 @@ IF %ERRORLEVEL% EQU 0 (
     exit /b 0
 )
 
-REM Committing changes
-git commit -m "CodeCommit repository update performed on (%DATE% %TIME%)" || (
+REM Committing changes with a deterministic sync(codecommit) subject/body.
+REM A malformed SYNC_SHA aborts here so it can never become the identifier.
+SET "SyncSubject="
+FOR /F "delims=" %%S IN ('python "%PyDir%\format_sync_message.py" --sha "%SYNC_SHA%" --timestamp "%SYNC_TIMESTAMP%" --build-tag "%BUILD_TAG%" --build-url "%BUILD_URL%" 2^>NUL') DO SET "SyncSubject=%%S"
+IF NOT DEFINED SyncSubject (
+    echo [ERROR] invalid SYNC_SHA. Set it to the 40-hex CodeCommit HEAD SHA. 1>&2
+    exit /b 1
+)
+python "%PyDir%\format_sync_message.py" --sha "%SYNC_SHA%" --timestamp "%SYNC_TIMESTAMP%" --build-tag "%BUILD_TAG%" --build-url "%BUILD_URL%" --format body > "%TEMP%\sync_body.txt" || (
+    echo [ERROR] could not build sync commit body 1>&2
+    exit /b 1
+)
+git commit -m "%SyncSubject%" -F "%TEMP%\sync_body.txt" || (
     echo [ERROR] git commit failed 1>&2
     exit /b 1
 )
+DEL /F /Q "%TEMP%\sync_body.txt" >NUL 2>&1
 
 REM Pushing changes to GitHub temporary branch (plain push; force-push forbidden)
 git push origin "%TemporaryBranch%" || (
     echo [ERROR] git push failed 1>&2
+    exit /b 1
+)
+
+REM Versioning: daily incremental sync-vYYYY.MM.DD-N tag on the sync commit.
+REM No-changes runs exit before the commit above, so they never reach this tag.
+FOR /F "delims=" %%D IN ('powershell -NoProfile -Command "(Get-Date).ToUniversalTime().ToString('yyyy.MM.dd')"') DO SET "SyncDate=%%D"
+FOR /F "delims=" %%D IN ('powershell -NoProfile -Command "(Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')"') DO SET "SyncDateIso=%%D"
+git fetch --tags origin || (
+    echo [ERROR] git fetch --tags failed 1>&2
+    exit /b 1
+)
+git tag --list "sync-v%SyncDate%-*" > "%TEMP%\sync_tags.txt" || (
+    echo [ERROR] git tag --list failed 1>&2
+    exit /b 1
+)
+SET "SyncTag="
+FOR /F "delims=" %%T IN ('python "%PyDir%\next_sync_tag.py" --date "%SyncDate%" --tags-file "%TEMP%\sync_tags.txt" 2^>NUL') DO SET "SyncTag=%%T"
+DEL /F /Q "%TEMP%\sync_tags.txt" >NUL 2>&1
+IF NOT DEFINED SyncTag (
+    echo [ERROR] could not compute sync tag 1>&2
+    exit /b 1
+)
+git tag "%SyncTag%" || (
+    echo [ERROR] git tag failed 1>&2
+    exit /b 1
+)
+git push origin "%SyncTag%" || (
+    echo [ERROR] git push tag failed 1>&2
     exit /b 1
 )
 
@@ -152,9 +205,11 @@ curl --fail-with-body --silent --show-error --request GET ^
 
 SET "ExistingPrUrl="
 FOR /F "delims=" %%U IN ('python -c "import json,os; p=os.environ.get('PR_RESPONSE_FILE',''); d=json.load(open(p)) if p else []; print((d[0].get('html_url') or '') if isinstance(d,list) and d else '')" 2^>NUL') DO SET "ExistingPrUrl=%%U"
+SET "PrUrl="
 IF DEFINED ExistingPrUrl (
     echo [INFO] Reusing existing Pull Request: %ExistingPrUrl%
-    exit /b 0
+    SET "PrUrl=%ExistingPrUrl%"
+    GOTO :prepend_changelog
 )
 
 REM Creating Pull Request on GitHub
@@ -178,6 +233,18 @@ if not exist "%ResponseFile%" (
 REM Fail the build when the API reports an error (message/errors) or no PR URL
 python -c "import json,os,sys; d=json.load(open(os.environ['PR_RESPONSE_FILE'])); e=d.get('message','') if isinstance(d,dict) else 'Unexpected API response'; u=d.get('html_url','') if isinstance(d,dict) else ''; sys.stderr.write('[ERROR] GitHub API: ' + e + '\n') if e else None; sys.stderr.write('[ERROR] API response has no Pull Request URL.\n') if not e and not u else None; sys.exit(1) if e or not u else print(u)" || (
     echo [ERROR] Pull Request was not created successfully. 1>&2
+    exit /b 1
+)
+
+FOR /F "delims=" %%U IN ('python -c "import json,os; d=json.load(open(os.environ['PR_RESPONSE_FILE'])); print(d.get('html_url','') if isinstance(d,dict) else '')" 2^>NUL') DO SET "PrUrl=%%U"
+
+:prepend_changelog
+REM Versioning: seed CHANGELOG.md once, then prepend one entry per sync tag.
+REM Only reached after a real commit+tag, never on the no-changes early exit.
+SET "PR_URL=%PrUrl%"
+SET "SYNC_TAG_VALUE=%SyncTag%"
+powershell -NoProfile -Command "$p=$env:ChangelogFile; if (!(Test-Path $p)) { Set-Content -Path $p -Value \"# Changelog`n`n## Unreleased`n\" }; $l=[System.Collections.ArrayList]@(Get-Content $p); $e=\"## $($env:SYNC_TAG_VALUE) - $($env:SyncDateIso) / $($env:SYNC_SHA) / $($env:PR_URL)\"; $i=$l.IndexOf('## Unreleased'); if ($i -lt 0) { $i=0 }; $l.Insert($i+1,$e); Set-Content -Path $p -Value $l" || (
+    echo [ERROR] CHANGELOG prepend failed 1>&2
     exit /b 1
 )
 
