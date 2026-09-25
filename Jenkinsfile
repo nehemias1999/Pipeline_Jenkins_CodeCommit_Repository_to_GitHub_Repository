@@ -7,9 +7,13 @@
  //   via withCredentials (env GH_TOKEN, masked); the secret never appears in
  //   echo output, or bat/sh arguments. Requires the Mask Passwords plugin
  //   for options { maskPasswords() }; withCredentials masks GH_TOKEN regardless.
- // Dependencies: Windows agent SERVER_1, git, curl, python3, Jenkins
- //   CredentialsBinding + Mask Passwords plugins.
- // =============================================================================
+// Dependencies: Windows agent SERVER_1, git, curl, python3, Jenkins
+//   CredentialsBinding + Mask Passwords plugins.
+// Traceability: 'Generate sync metadata' records the CodeCommit HEAD SHA +
+//   Jenkins build tag/url into sync-metadata.json (WORKSPACE root, never the
+//   clone) and exposes SYNC_SHA/SYNC_TIMESTAMP to the push script so the PR
+//   body carries SHA/build/url/timestamp; both JSON artifacts are archived.
+// =============================================================================
  pipeline {
 
      agent { label 'SERVER_1' }
@@ -259,6 +263,44 @@
 
         }
 
+        stage('Generate sync metadata') {
+
+            when {
+                expression { return env.hasChanges == "true" || env.ForcePipelineRun == "true" }
+            }
+
+            steps {
+
+                echo 'Start Generate sync metadata'
+
+                script {
+
+                    // Source of truth: HEAD SHA of the CodeCommit clone, post-fetch.
+                    dir("${env.CodeCommitRepositoryPath}") {
+                        def rawSha = bat(script: 'git rev-parse HEAD', returnStdout: true).trim()
+                        env.SYNC_SHA = rawSha.split("\\r?\\n")[-1].trim()
+                    }
+
+                    if (!(env.SYNC_SHA ==~ /^[0-9a-fA-F]{40}$/)) {
+                        error("Invalid SYNC_SHA '${env.SYNC_SHA}'. Expected 40 hex chars from git rev-parse HEAD.")
+                    }
+
+                    // UTC timestamp in ISO-8601 (sortable, locale-independent).
+                    env.SYNC_TIMESTAMP = powershell(script: '(Get-Date).ToUniversalTime().ToString("o")', returnStdout: true).trim()
+
+                    // Metadata lives in WORKSPACE root, never inside either clone.
+                    bat """
+                        python "py\\generate_sync_metadata.py" --sha ${env.SYNC_SHA} --branch "${env.CodeCommitRepositoryBranch}" --base "${env.GitHubRepositoryDestinyBranch}" --head "${env.GitHubRepositoryTemporaryBranch}" --build-tag "${env.BUILD_TAG}" --build-url "${env.BUILD_URL}" --timestamp "${env.SYNC_TIMESTAMP}" --output "%WORKSPACE%\\sync-metadata.json"
+                    """
+
+                }
+
+                echo 'End Generate sync metadata'
+
+            }
+
+        }
+
         stage('Push updated GitHub repository') {
 
             when {
@@ -284,11 +326,17 @@
 
                             // BREAKING: push script no longer takes a token argument;
                             // it reads GH_TOKEN from the environment.
+                            // SYNC_SHA/SYNC_TIMESTAMP flow to the script via env so the
+                            // PR title/body carries CodeCommit SHA, BUILD_TAG,
+                            // BUILD_URL and UTC timestamp.
                             bat """
                                 "bat\\PushAndPullRequestToGitHubRemoteRepository.bat" "${env.GitHubLocalRepositoryPath}" ${gitHubRepositoryName} "${env.GitHubRepositoryUsername}" "${env.GitHubRepositoryEmail}" ${env.GitHubRepositoryTemporaryBranch} ${env.GitHubRepositoryDestinyBranch}
                             """
 
                         }
+
+                        // Traceability artifacts: archived from WORKSPACE root.
+                        archiveArtifacts artifacts: 'sync-metadata.json,pullrequest_response.json', allowEmptyArchive: false
 
                     } catch (err) {
 

@@ -12,6 +12,9 @@ REM Author: pipeline-security implementer
 REM Usage: PushAndPullRequestToGitHubRemoteRepository.bat <LocalPath> <owner/repo> <UserName> <Email> <TempBranch> <BaseBranch>
 REM   Help: PushAndPullRequestToGitHubRemoteRepository.bat /?
 REM Env Vars: GH_TOKEN (required, API token), WORKSPACE (optional, response file target)
+REM   SYNC_SHA, SYNC_TIMESTAMP (traceability, set by Jenkins 'Generate sync metadata'
+REM   stage), BUILD_TAG, BUILD_URL (Jenkins built-ins reused for the PR body).
+REM   When SYNC_*/BUILD_* are unset (local runs) they default to "unknown".
 REM Dependencies: git, curl (7.76+ for --fail-with-body), python3 (JSON checks)
 REM Output: pullrequest_response.json in %WORKSPACE% (or cwd when WORKSPACE is
 REM   unset); informational messages on stdout, errors on stderr.
@@ -62,6 +65,13 @@ REM ==============================
 
 SET "PullRequestTitle=Update from CodeCommit repository"
 SET "PullRequestBody=Update from CodeCommit repository on branch %TemporaryBranch% of repository %GitHubRepositoryName%."
+REM Traceability: PR body carries CodeCommit SHA, Jenkins build tag/url, UTC ts.
+IF NOT DEFINED SYNC_SHA SET "SYNC_SHA=unknown"
+IF NOT DEFINED BUILD_TAG SET "BUILD_TAG=unknown"
+IF NOT DEFINED BUILD_URL SET "BUILD_URL=unknown"
+IF NOT DEFINED SYNC_TIMESTAMP SET "SYNC_TIMESTAMP=unknown"
+SET "PullRequestTitle=Update from CodeCommit repository (%SYNC_SHA:~0,7%)"
+SET "PullRequestBody=Update from CodeCommit repository on branch %TemporaryBranch% of repository %GitHubRepositoryName%.\n\nCodeCommit SHA: %SYNC_SHA%\nJenkins Build: %BUILD_TAG% %BUILD_URL%\nTimestamp UTC: %SYNC_TIMESTAMP%"
 IF DEFINED WORKSPACE (
     SET "ResponseFile=%WORKSPACE%\pullrequest_response.json"
 ) ELSE (
@@ -92,6 +102,16 @@ git config user.email "%GitHubRepositoryEmail%" || (
 REM Creating or updating temporary branch
 git checkout -B "%TemporaryBranch%" || (
     echo [ERROR] git checkout failed 1>&2
+    exit /b 1
+)
+
+REM Traceability guard: sync-metadata.json and pullrequest_response.json live
+REM in WORKSPACE, never inside the clone; drop strays and refuse to commit them.
+IF EXIST "pullrequest_response.json" DEL /F /Q "pullrequest_response.json"
+IF EXIST "sync-metadata.json" DEL /F /Q "sync-metadata.json"
+git status --porcelain -- "pullrequest_response.json" "sync-metadata.json" | findstr /R "." >NUL
+IF %ERRORLEVEL% EQU 0 (
+    echo [ERROR] traceability JSON must not be committed from the clone 1>&2
     exit /b 1
 )
 
