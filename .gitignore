@@ -1,0 +1,6 @@
+.worktrees/
+__pycache__/
+.pytest_cache/
+*.pyc
+sync-metadata.json
+pullrequest_response.json
