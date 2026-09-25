@@ -1,8 +1,22 @@
-pipeline {
+// ==============================================================================
+ // Jenkins Declarative Pipeline: sync AWS CodeCommit to GitHub via PR.
+ // Purpose: detect CodeCommit changes, mirror content into the GitHub clone,
+ //   push a temp branch with a plain push (force-push forbidden) and open
+ // Trigger: parameterized manual/scheduled run (params) + change detection.
+ // Secrets: credentialsId 'GITHUB_TOKEN' is bound ONLY inside the push stage
+ //   via withCredentials (env GH_TOKEN, masked); the secret never appears in
+ //   echo output, or bat/sh arguments. Requires the Mask Passwords plugin
+ //   for options { maskPasswords() }; withCredentials masks GH_TOKEN regardless.
+ // Dependencies: Windows agent SERVER_1, git, curl, python3, Jenkins
+ //   CredentialsBinding + Mask Passwords plugins.
+ // =============================================================================
+ pipeline {
 
-    agent { label 'SERVER_1' }
+     agent { label 'SERVER_1' }
 
-    environment {
+     options { maskPasswords() }
+
+     environment {
 
         /* Pipeline Parameters */
 
@@ -37,16 +51,50 @@ pipeline {
 
         /* Stage: Push updated GitHub repository */
 
-        // GitHub Personal Access Token for API authentication
-        GitHubRepositoryToken = credentials('GITHUB_TOKEN')
         // Username to be used for Git commits
         GitHubRepositoryUsername = 'github_username'
         // Email to be used for Git commits
         GitHubRepositoryEmail = 'github_email@gmail.com'
+        // NOTE: the GitHub API token (credentialsId 'GITHUB_TOKEN') is bound
+        // exclusively inside the push stage via withCredentials as GH_TOKEN;
+        // it MUST NOT live in environment (leaks to every stage/log).
 
     }
 
     stages {
+
+        // Fail fast on malformed repository URLs before any git clone or API call.
+        stage('Validate repository URLs') {
+
+            steps {
+
+                echo 'Start Validate repository URLs'
+
+                script {
+
+                    def gitHubUrlOk = bat(script: """
+                        python "py\\ExtractGitHubRepositoryName.py" "${env.GitHubRepositoryURL}" > NUL
+                    """, returnStatus: true)
+
+                    if (gitHubUrlOk != 0) {
+                        error("Invalid GitHubRepositoryURL. Expected 'https://github.com/{owner}/{repo}[.git]' or 'git@github.com:{owner}/{repo}[.git]'.")
+                    }
+
+                    def codeCommitUrlOk = powershell(script: """
+                        if ('${env.CodeCommitRepositoryURL}' -notmatch '^(https://|ssh://|git@|codecommit://)') { exit 1 } else { exit 0 }
+                    """, returnStatus: true)
+
+                    if (codeCommitUrlOk != 0) {
+                        error("Invalid CodeCommitRepositoryURL. Expected an HTTPS or SSH remote URL.")
+                    }
+
+                }
+
+                echo 'End Validate repository URLs'
+
+            }
+
+        }
 
         stage('Checking Changes') {
 
@@ -225,15 +273,22 @@ pipeline {
 
                     try {
 
-                        def gitHubRepositoryName = bat(script: """
-                            python "py\\ExtractGitHubRepositoryName.py" "${env.GitHubRepositoryURL}" 
-                        """, returnStdout: true).trim()
+                        // Secret handling: GH_TOKEN is injected by withCredentials
+                        // as a masked env var for this block only. It is NEVER
+                        // interpolated into echo/bat arguments (would leak via ps/logs).
+                        withCredentials([string(credentialsId: 'GITHUB_TOKEN', variable: 'GH_TOKEN')]) {
 
-                        gitHubRepositoryName = gitHubRepositoryName.split(";")[-1].trim()
+                            def gitHubRepositoryName = bat(script: """
+                                python "py\\ExtractGitHubRepositoryName.py" "${env.GitHubRepositoryURL}"
+                            """, returnStdout: true).trim()
 
-                        bat """
-                            "bat\\PushAndPullRequestToGitHubRemoteRepository.bat" "${env.GitHubLocalRepositoryPath}" ${gitHubRepositoryName} "${env.GitHubRepositoryToken}" "${env.GitHubRepositoryUsername}" "${env.GitHubRepositoryEmail}" ${env.GitHubRepositoryTemporaryBranch} ${env.GitHubRepositoryDestinyBranch}
-                        """
+                            // BREAKING: push script no longer takes a token argument;
+                            // it reads GH_TOKEN from the environment.
+                            bat """
+                                "bat\\PushAndPullRequestToGitHubRemoteRepository.bat" "${env.GitHubLocalRepositoryPath}" ${gitHubRepositoryName} "${env.GitHubRepositoryUsername}" "${env.GitHubRepositoryEmail}" ${env.GitHubRepositoryTemporaryBranch} ${env.GitHubRepositoryDestinyBranch}
+                            """
+
+                        }
 
                     } catch (err) {
 
