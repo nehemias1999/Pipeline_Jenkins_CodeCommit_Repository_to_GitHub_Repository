@@ -13,6 +13,12 @@
 //   Jenkins build tag/url into sync-metadata.json (WORKSPACE root, never the
 //   clone) and exposes SYNC_SHA/SYNC_TIMESTAMP to the push script so the PR
 //   body carries SHA/build/url/timestamp; both JSON artifacts are archived.
+// Versioning: the push script commits with a deterministic
+//   'sync(codecommit): <short7> <timestamp>' subject/body (py/format_sync_message),
+//   tags the sync commit 'sync-vYYYY.MM.DD-N' (py/next_sync_tag, incremental per
+//   day), and prepends a '## sync-v... - <date> / SHA / PR' entry to CHANGELOG.md
+//   (seeded with '# Changelog' + '## Unreleased'). Runs with no staged changes
+//   exit before committing, so they create neither tag nor changelog entry.
 // =============================================================================
  pipeline {
 
@@ -328,7 +334,9 @@
                             // it reads GH_TOKEN from the environment.
                             // SYNC_SHA/SYNC_TIMESTAMP flow to the script via env so the
                             // PR title/body carries CodeCommit SHA, BUILD_TAG,
-                            // BUILD_URL and UTC timestamp.
+                            // BUILD_URL and UTC timestamp, and so the script can
+                            // commit with the sync(codecommit) subject, push the
+                            // sync-v tag, and prepend the CHANGELOG.md entry.
                             bat """
                                 "bat\\PushAndPullRequestToGitHubRemoteRepository.bat" "${env.GitHubLocalRepositoryPath}" ${gitHubRepositoryName} "${env.GitHubRepositoryUsername}" "${env.GitHubRepositoryEmail}" ${env.GitHubRepositoryTemporaryBranch} ${env.GitHubRepositoryDestinyBranch}
                             """
