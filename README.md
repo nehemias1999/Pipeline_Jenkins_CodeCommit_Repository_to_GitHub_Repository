@@ -1,79 +1,120 @@
 # Pipeline Jenkins CodeCommit Repository to GitHub Repository
 
-This project defines a Jenkins pipeline designed to automatically synchronize an AWS CodeCommit repository to a GitHub repository. It checks for changes in the source CodeCommit repository, clones it, and then pushes the changes to a temporary branch in the destination GitHub repository, creating a Pull Request for review.
+Sincronización automática y auditable de un repositorio AWS CodeCommit hacia GitHub, con secretos enmascarados, trazabilidad por SHA, versionado determinista y soporte Windows + Linux.
 
-## Technologies Used
+## Table of Contents
 
-*   **Jenkins**: Automation server for building, deploying, and automating the project.
-*   **Groovy**: Language used for the Jenkins Pipeline script (`Jenkinsfile`).
-*   **Batch Scripting (.bat)**: Used for Windows-based command execution (Git operations, file copying).
-*   **Python**: Used to extract the GitHub repository name from the URL.
-*   **Git**: Version control system for cloning, fetching, and pushing changes.
-*   **AWS CodeCommit**: Source repository.
-*   **GitHub**: Destination repository.
+- [Background](#background)
+- [Install](#install)
+- [Usage](#usage)
+- [API / Configuration](#api--configuration)
+- [Contributing](#contributing)
+- [License](#license)
 
-## Prerequisites
+## Background
 
-Before running this pipeline, ensure the following requirements are met on the Jenkins server (agent):
+### Contexto
 
-1.  **Software Installed**:
-    *   **Git**: Accessible via command line.
-    *   **Python 3.x**: Accessible via command line.
-    *   **PowerShell**: Version 5.0 or later.
-2.  **Jenkins Credentials**:
-    *   `CODECOMMIT_CREDENTIALS`: Credentials for accessing AWS CodeCommit (Username/Password or SSH Key).
-    *   `GITHUB_CREDENTIALS`: Credentials for accessing GitHub (Username/Password or Token).
-    *   `GITHUB_TOKEN`: A GitHub Personal Access Token (PAT) with `repo` scope permissions to create Pull Requests via the API.
-3.  **Jenkins Plugins**:
-    *   **Git Plugin**: For Git operations.
-    *   **Pipeline**: For declarative pipeline support.
-    *   **Credentials Binding**: To securely handle credentials.
+El pipeline detecta cambios en la rama monitoreada de CodeCommit, los copia al clon de GitHub, los publica en una rama temporal y abre (o reutiliza) un Pull Request hacia la rama destino. Está endurecido tras el change `hardening-cicd` (ver `openspec/changes/archive/hardening-cicd/` como fuente de verdad de requirements): el token nunca viaja en argumentos ni logs, el push nunca usa `--force`, cada sync deja metadatos archivados y cada commit sigue un formato trazable.
 
-## Pipeline Workflow
+### Tecnologías
 
-The pipeline consists of the following stages:
+- **Jenkins** (declarative pipeline, Groovy): orquestación.
+- **Batch (.bat) + POSIX shell (sh/)**: operaciones Git y copia de archivos (`robocopy` en Windows, `rsync` en Linux).
+- **Python 3.9+**: `ExtractGitHubRepositoryName.py`, `generate_sync_metadata.py`, `format_sync_message.py`, `next_sync_tag.py`.
+- **Git + GitHub REST API** (`POST/GET /repos/{owner}/{repo}/pulls`): publicación y PR idempotente.
+- **AWS CodeCommit** (origen) y **GitHub** (destino).
 
-1.  **Checking Changes**:
-    *   Checks if the local CodeCommit repository exists. If not, it clones it.
-    *   Fetches updates from the remote CodeCommit repository.
-    *   Compares the local branch with the remote branch to detect changes.
-    *   If changes are detected (or `Force Pipeline Run` is true), the pipeline proceeds. Otherwise, it stops.
+### Arquitectura / Flujo
 
-2.  **Clone CodeCommit repository**:
-    *   Clones the source repository from AWS CodeCommit to a local `CodeCommit` folder.
+```text
+CodeCommit (origen) --> Checking Changes --> Clone CodeCommit --> Clone GitHub
+      --> Copy content (robocopy/rsync, con exclusiones)
+      --> Commit sync(codecommit): <sha> --> push (sin --force)
+      --> PR idempotente --> artefactos archivados
+```
 
-3.  **Clone GitHub repository**:
-    *   Clones the destination repository from GitHub to a local `GitHub` folder.
+1. **Checking Changes**: clona el repo CodeCommit si no existe, hace `fetch` y compara la rama local con la remota. Sin cambios y sin forzado, el build termina `NOT_BUILT`.
+2. **Clone CodeCommit / Clone GitHub**: clones frescos en `<LocalFolder>/CodeCommit` y `<LocalFolder>/GitHub`.
+3. **Copy content**: `bat/CopyContentToLocalRepository.bat` o `sh/copy-content.sh` según `isUnix()`. Excluye `.git/`, `.github/`, `.cursor/`, `docker-compose.yaml|.yml`, `.gitignore`, `.gitattributes`, `README.md`, `.cursorrules`.
+4. **Push + PR**: calcula el SHA (`git rev-parse HEAD`), genera `sync-metadata.json`, commitea `sync(codecommit): <short7> <ts-UTC>`, crea el tag `sync-vYYYY.MM.DD-N`, antepone entrada en `CHANGELOG.md`, hace `push` normal y crea (o reutiliza) el PR con body trazable. Archiva `sync-metadata.json` y `pullrequest_response.json` fuera del clon.
 
-4.  **Copy CodeCommit repository content into GitHub repository**:
-    *   Executes `bat\CopyContentToLocalRepository.bat`.
-    *   Uses `robocopy` to mirror the content from the CodeCommit folder to the GitHub folder.
-    *   **Exclusions**: It excludes `.git`, `.github`, `.cursor` directories and specific files like `docker-compose.yaml`, `README.md`, etc., to avoid overwriting repository-specific configurations.
+## Install
 
-5.  **Push updated GitHub repository**:
-    *   Extracts the GitHub repository name using `py\ExtractGitHubRepositoryName.py`.
-    *   Executes `bat\PushAndPullRequestToGitHubRemoteRepository.bat`.
-    *   Configures Git identity.
-    *   Creates or switches to a temporary branch.
-    *   Commits the changes with a timestamped message.
-    *   Pushes the temporary branch to GitHub.
-    *   Uses `curl` to call the GitHub API and create a Pull Request from the temporary branch to the target branch.
+### Prerrequisitos
 
-## Parameters
+- Agente Jenkins Windows (`powershell >= 5.0`, `robocopy`) o Linux (`bash`, `rsync`, `curl`, `python3 >= 3.9`).
+- En el agente: `git`, `python3`, `curl` en `PATH`.
+- Plugins Jenkins: **Git**, **Pipeline**, **Credentials Binding** (+ **Mask Passwords** y **AnsiColor** para `maskPasswords()`/`ansiColor`).
+- Credenciales Jenkins:
+  - `CODECOMMIT_CREDENTIALS` (usuario/contraseña o SSH).
+  - `GITHUB_CREDENTIALS` (usuario/token para `git`).
+  - `GITHUB_TOKEN` (Secret Text, PAT con scope `repo`).
+- Verificación local (sin Jenkins): `python3 >= 3.9`, `pytest`, `bash`.
 
-The pipeline accepts the following parameters:
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/ -q
+bash -n sh/copy-content.sh && bash -n sh/push-and-pr.sh
+```
 
-*   **Force Pipeline Run**: (Boolean) If checked, forces the pipeline to run even if no changes are detected in CodeCommit.
-*   **Local Folder Path**: The base directory on the Jenkins agent where repositories will be cloned.
-*   **CodeCommit Repository URL**: The HTTP(S) or SSH URL of the source AWS CodeCommit repository.
-*   **CodeCommit Repository Branch**: The branch in CodeCommit to monitor and sync.
-*   **GitHub Repository URL**: The HTTP(S) or SSH URL of the destination GitHub repository.
-*   **GitHub Repository Pull/PR Branch**: The target branch in GitHub (e.g., `main` or `master`) where the changes will be merged.
-*   **GitHub Repository Push Branch**: The name of the temporary branch to create and push to GitHub (e.g., `update-from-codecommit`).
+## Usage
 
-## Scripts Description
+Happy path en Jenkins: crear un job de pipeline apuntando a este repo, completar los parámetros y lanzar. Con cambios en CodeCommit (o `FORCE_PIPELINE_RUN`), el job deja un PR listo para revisión con el SHA origen y el link al build en su descripción.
 
-*   **`Jenkinsfile`**: Main pipeline definition.
-*   **`py\ExtractGitHubRepositoryName.py`**: Python script to parse the GitHub URL and extract the "owner/repo" string required for the API call.
-*   **`bat\CopyContentToLocalRepository.bat`**: Batch script using `robocopy` to sync files from source to destination, handling exclusions.
-*   **`bat\PushAndPullRequestToGitHubRemoteRepository.bat`**: Batch script to handle Git commit, push, and GitHub API call for Pull Request creation.
+```bash
+# Validar el extractor
+python py/ExtractGitHubRepositoryName.py "https://github.com/acme/demo.git"
+# Generar metadatos de un sync (ejemplo)
+python py/generate_sync_metadata.py --sha abc1234567890abcdef1234567890abcdef1234 \
+  --branch main --base main --head sync-codecommit \
+  --build-tag "sync-42" --build-url "https://jenkins/job/42/" \
+  --timestamp "2026-09-25T12:34:56Z" --output sync-metadata.json
+# Seco portable en Linux
+sh/copy-content.sh "/tmp/CodeCommit" "/tmp/GitHub"
+```
+
+## API / Configuration
+
+Parámetros del job (`parameters`, todos con defaults):
+
+| Parámetro | Tipo | Default | Formato |
+|---|---|---|---|
+| `FORCE_PIPELINE_RUN` | boolean | `false` | `true` ejecuta aunque no haya cambios |
+| `LOCAL_FOLDER_PATH` | string | `''` | Ruta base del agente (ej. `C:\sync` o `/var/sync`) |
+| `CODECOMMIT_REPOSITORY_URL` | string | `''` | HTTPS o SSH de CodeCommit |
+| `CODECOMMIT_REPOSITORY_BRANCH` | string | `main` | Rama origen monitoreada |
+| `GITHUB_REPOSITORY_URL` | string | `''` | `https://github.com/{owner}/{repo}[.git]` o `git@github.com:{owner}/{repo}[.git]` |
+| `GITHUB_REPOSITORY_DESTINY_BRANCH` | string | `main` | Rama base del PR |
+| `GITHUB_REPOSITORY_TEMPORARY_BRANCH` | string | `update-from-codecommit` | Rama head del PR |
+| `AGENT_LABEL` | string | `SERVER_1` | Label del agente |
+| `GITHUB_USERNAME` / `GITHUB_EMAIL` | string | `sync-bot` / `sync-bot@local` | Identidad de los commits de sync |
+
+Variables de entorno internas (no parametrizar): `GH_TOKEN` (inyectado vía `withCredentials`, nunca como argumento), `SYNC_SHA`, `SYNC_TIMESTAMP`, `BUILD_TAG`, `BUILD_URL`, `WORKSPACE`.
+
+`options`: `timestamps()`, `timeout(30 min)`, `buildDiscarder(30 builds)`, `disableConcurrentBuilds()`, `ansiColor('xterm')`.
+
+Scripts:
+
+- `py/ExtractGitHubRepositoryName.py <url>` → imprime `owner/repo` en stdout; errores a stderr, exit `1`.
+- `py/generate_sync_metadata.py --sha ... --output sync-metadata.json` → JSON de 7 campos; error exit `2`.
+- `py/format_sync_message.py` / `py/next_sync_tag.py` → subject `sync(codecommit): <short7> <ts>` y tag `sync-vYYYY.MM.DD-N`.
+- `bat/*.bat` / `sh/*.sh` → mismo contrato CLI (rutas); el token solo por env `GH_TOKEN`; rechazan argumentos con forma de token.
+
+Limitación conocida: el stage `Checking Changes` aún usa `powershell(...)` incondicional, por lo que un agente Linux requiere PowerShell instalado (follow-up: dispatch `isUnix()`).
+
+## Contributing
+
+Entorno local:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/ -q   # 29 tests: extractor, metadata, versionado, portabilidad
+openspec validate hardening-cicd
+```
+
+Convención de commits: `sync(codecommit): <short7> <timestamp-UTC>` para commits de sincronización en runtime; para desarrollo usar Conventional Commits (`feat(...)`, `fix(...)`, `chore(...)`). Todo cambio de comportamiento pasa por `openspec new change` + `openspec validate` y se entrega vía PR a `main` (nunca push directo), con `CHANGELOG.md` actualizado cuando aplique.
+
+## License
+
+Sin archivo `LICENSE` en el repo: todos los derechos reservados a sus autores hasta declarar una licencia explícita.
