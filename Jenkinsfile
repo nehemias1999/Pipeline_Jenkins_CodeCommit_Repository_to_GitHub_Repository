@@ -7,8 +7,11 @@
  //   via withCredentials (env GH_TOKEN, masked); the secret never appears in
  //   echo output, or bat/sh arguments. Requires the Mask Passwords plugin
  //   for options { maskPasswords() }; withCredentials masks GH_TOKEN regardless.
-// Dependencies: Windows agent SERVER_1, git, curl, python3, Jenkins
-//   CredentialsBinding + Mask Passwords plugins.
+// Dependencies: agent label from params.AGENT_LABEL (default SERVER_1 Windows;
+//   any Linux label runs the POSIX mirror), git, curl, python3, Jenkins
+//   CredentialsBinding + Mask Passwords plugins. Linux agents additionally
+//   require rsync + bash for sh/copy-content.sh; every bat/sh invocation is
+//   chosen with isUnix() so both OS families run the same contract.
 // Traceability: 'Generate sync metadata' records the CodeCommit HEAD SHA +
 //   Jenkins build tag/url into sync-metadata.json (WORKSPACE root, never the
 //   clone) and exposes SYNC_SHA/SYNC_TIMESTAMP to the push script so the PR
@@ -22,9 +25,29 @@
 // =============================================================================
  pipeline {
 
-     agent { label 'SERVER_1' }
+    agent { label "${params.AGENT_LABEL}" }
 
-     options { maskPasswords() }
+    // Declared job parameters (defaults = current job values; AGENT_LABEL
+    // keeps today's Windows agent while allowing a Linux agent override).
+    parameters {
+        booleanParam(name: 'Force Pipeline Run', defaultValue: false, description: 'Force execution of the pipeline regardless of changes')
+        string(name: 'Local Folder Path', defaultValue: '', description: 'Base local directory path for cloning repositories')
+        string(name: 'CodeCommit Repository URL', defaultValue: '', description: 'URL of the source AWS CodeCommit repository')
+        string(name: 'CodeCommit Repository Branch', defaultValue: 'main', description: 'Branch to check for changes and clone from CodeCommit')
+        string(name: 'GitHub Repository URL', defaultValue: '', description: 'URL of the destination GitHub repository')
+        string(name: 'GitHub Repository Pull/PR Branch', defaultValue: 'main', description: 'Target branch in GitHub where the Pull Request will be created')
+        string(name: 'GitHub Repository Push Branch', defaultValue: 'update-from-codecommit', description: 'Temporary branch name to be created and pushed to GitHub')
+        string(name: 'AGENT_LABEL', defaultValue: 'SERVER_1', description: 'Jenkins agent label (Windows SERVER_1 today, Linux label for POSIX runs)')
+    }
+
+    options {
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        disableConcurrentBuilds()
+        ansiColor('xterm')
+        maskPasswords()
+    }
 
      environment {
 
@@ -55,9 +78,10 @@
         /* Stage: Copy CodeCommit repository content into GitHub repository */
 
         // Command to execute the script that copies content from CodeCommit to GitHub repo
+        // (both args quoted: paths may contain spaces; the .bat strips quotes via %~1/%~2)
         CopyContentToLocalRepositoryScript = '"bat\\CopyContentToLocalRepository.bat" ' +
                                              '"%CodeCommitRepositoryPath%" ' +
-                                             "%GitHubLocalRepositoryPath%"
+                                             '"%GitHubLocalRepositoryPath%"'
 
         /* Stage: Push updated GitHub repository */
 
@@ -82,17 +106,30 @@
 
                 script {
 
-                    def gitHubUrlOk = bat(script: """
-                        python "py\\ExtractGitHubRepositoryName.py" "${env.GitHubRepositoryURL}" > NUL
-                    """, returnStatus: true)
+                    // Portable URL validation: native shell per agent OS.
+                    def gitHubUrlOk
+                    def codeCommitUrlOk
+                    if (isUnix()) {
+                        gitHubUrlOk = sh(script: """
+                            python3 "py/ExtractGitHubRepositoryName.py" "${env.GitHubRepositoryURL}" > /dev/null
+                        """, returnStatus: true)
+
+                        codeCommitUrlOk = sh(script: """
+                            printf '%s' "${env.CodeCommitRepositoryURL}" | grep -Eq '^(https://|ssh://|git@|codecommit://)'
+                        """, returnStatus: true)
+                    } else {
+                        gitHubUrlOk = bat(script: """
+                            python "py\\ExtractGitHubRepositoryName.py" "${env.GitHubRepositoryURL}" > NUL
+                        """, returnStatus: true)
+
+                        codeCommitUrlOk = powershell(script: """
+                            if ('${env.CodeCommitRepositoryURL}' -notmatch '^(https://|ssh://|git@|codecommit://)') { exit 1 } else { exit 0 }
+                        """, returnStatus: true)
+                    }
 
                     if (gitHubUrlOk != 0) {
                         error("Invalid GitHubRepositoryURL. Expected 'https://github.com/{owner}/{repo}[.git]' or 'git@github.com:{owner}/{repo}[.git]'.")
                     }
-
-                    def codeCommitUrlOk = powershell(script: """
-                        if ('${env.CodeCommitRepositoryURL}' -notmatch '^(https://|ssh://|git@|codecommit://)') { exit 1 } else { exit 0 }
-                    """, returnStatus: true)
 
                     if (codeCommitUrlOk != 0) {
                         error("Invalid CodeCommitRepositoryURL. Expected an HTTPS or SSH remote URL.")
@@ -250,9 +287,16 @@
 
                     try {
 
-                        bat """
-                            ${env.CopyContentToLocalRepositoryScript}
-                        """
+                        // Portable copy: rsync mirror on Linux, robocopy on Windows.
+                        if (isUnix()) {
+                            sh """
+                                "sh/copy-content.sh" "${env.CodeCommitRepositoryPath}" "${env.GitHubLocalRepositoryPath}"
+                            """
+                        } else {
+                            bat """
+                                ${env.CopyContentToLocalRepositoryScript}
+                            """
+                        }
 
                     } catch (err) {
 
@@ -283,7 +327,12 @@
 
                     // Source of truth: HEAD SHA of the CodeCommit clone, post-fetch.
                     dir("${env.CodeCommitRepositoryPath}") {
-                        def rawSha = bat(script: 'git rev-parse HEAD', returnStdout: true).trim()
+                        def rawSha
+                        if (isUnix()) {
+                            rawSha = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+                        } else {
+                            rawSha = bat(script: 'git rev-parse HEAD', returnStdout: true).trim()
+                        }
                         env.SYNC_SHA = rawSha.split("\\r?\\n")[-1].trim()
                     }
 
@@ -292,12 +341,22 @@
                     }
 
                     // UTC timestamp in ISO-8601 (sortable, locale-independent).
-                    env.SYNC_TIMESTAMP = powershell(script: '(Get-Date).ToUniversalTime().ToString("o")', returnStdout: true).trim()
+                    if (isUnix()) {
+                        env.SYNC_TIMESTAMP = sh(script: 'date --utc +%Y-%m-%dT%H:%M:%SZ', returnStdout: true).trim()
+                    } else {
+                        env.SYNC_TIMESTAMP = powershell(script: '(Get-Date).ToUniversalTime().ToString("o")', returnStdout: true).trim()
+                    }
 
                     // Metadata lives in WORKSPACE root, never inside either clone.
-                    bat """
-                        python "py\\generate_sync_metadata.py" --sha ${env.SYNC_SHA} --branch "${env.CodeCommitRepositoryBranch}" --base "${env.GitHubRepositoryDestinyBranch}" --head "${env.GitHubRepositoryTemporaryBranch}" --build-tag "${env.BUILD_TAG}" --build-url "${env.BUILD_URL}" --timestamp "${env.SYNC_TIMESTAMP}" --output "%WORKSPACE%\\sync-metadata.json"
-                    """
+                    if (isUnix()) {
+                        sh """
+                            python3 "py/generate_sync_metadata.py" --sha ${env.SYNC_SHA} --branch "${env.CodeCommitRepositoryBranch}" --base "${env.GitHubRepositoryDestinyBranch}" --head "${env.GitHubRepositoryTemporaryBranch}" --build-tag "${env.BUILD_TAG}" --build-url "${env.BUILD_URL}" --timestamp "${env.SYNC_TIMESTAMP}" --output "${env.WORKSPACE}/sync-metadata.json"
+                        """
+                    } else {
+                        bat """
+                            python "py\\generate_sync_metadata.py" --sha ${env.SYNC_SHA} --branch "${env.CodeCommitRepositoryBranch}" --base "${env.GitHubRepositoryDestinyBranch}" --head "${env.GitHubRepositoryTemporaryBranch}" --build-tag "${env.BUILD_TAG}" --build-url "${env.BUILD_URL}" --timestamp "${env.SYNC_TIMESTAMP}" --output "%WORKSPACE%\\sync-metadata.json"
+                        """
+                    }
 
                 }
 
@@ -326,9 +385,16 @@
                         // interpolated into echo/bat arguments (would leak via ps/logs).
                         withCredentials([string(credentialsId: 'GITHUB_TOKEN', variable: 'GH_TOKEN')]) {
 
-                            def gitHubRepositoryName = bat(script: """
-                                python "py\\ExtractGitHubRepositoryName.py" "${env.GitHubRepositoryURL}"
-                            """, returnStdout: true).trim()
+                            def gitHubRepositoryName
+                            if (isUnix()) {
+                                gitHubRepositoryName = sh(script: """
+                                    python3 "py/ExtractGitHubRepositoryName.py" "${env.GitHubRepositoryURL}"
+                                """, returnStdout: true).trim()
+                            } else {
+                                gitHubRepositoryName = bat(script: """
+                                    python "py\\ExtractGitHubRepositoryName.py" "${env.GitHubRepositoryURL}"
+                                """, returnStdout: true).trim()
+                            }
 
                             // BREAKING: push script no longer takes a token argument;
                             // it reads GH_TOKEN from the environment.
@@ -337,9 +403,16 @@
                             // BUILD_URL and UTC timestamp, and so the script can
                             // commit with the sync(codecommit) subject, push the
                             // sync-v tag, and prepend the CHANGELOG.md entry.
-                            bat """
-                                "bat\\PushAndPullRequestToGitHubRemoteRepository.bat" "${env.GitHubLocalRepositoryPath}" ${gitHubRepositoryName} "${env.GitHubRepositoryUsername}" "${env.GitHubRepositoryEmail}" ${env.GitHubRepositoryTemporaryBranch} ${env.GitHubRepositoryDestinyBranch}
-                            """
+                            // Portable push: POSIX script on Linux, .bat on Windows.
+                            if (isUnix()) {
+                                sh """
+                                    "sh/push-and-pr.sh" "${env.GitHubLocalRepositoryPath}" ${gitHubRepositoryName} "${env.GitHubRepositoryUsername}" "${env.GitHubRepositoryEmail}" ${env.GitHubRepositoryTemporaryBranch} ${env.GitHubRepositoryDestinyBranch}
+                                """
+                            } else {
+                                bat """
+                                    "bat\\PushAndPullRequestToGitHubRemoteRepository.bat" "${env.GitHubLocalRepositoryPath}" ${gitHubRepositoryName} "${env.GitHubRepositoryUsername}" "${env.GitHubRepositoryEmail}" ${env.GitHubRepositoryTemporaryBranch} ${env.GitHubRepositoryDestinyBranch}
+                                """
+                            }
 
                         }
 
